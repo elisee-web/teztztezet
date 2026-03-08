@@ -1,0 +1,1185 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Cabinet Comptable — Suivi TVA</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+</head>
+<body style="margin:0;padding:0;background:#f4f2ef;">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useMemo } = React;
+
+// ─── Palette ─────────────────────────────────────────────────────────────────
+const C = {
+  bg:"#f4f2ef", card:"#ffffff", border:"#e8e3dc", borderL:"#f0ece6",
+  text:"#28251f", muted:"#9e978d", light:"#c2bab0",
+  sage:"#6d9b78", sageL:"#edf4ef", sageD:"#4e7859",
+  blue:"#6a8fb5", blueL:"#edf2f8",
+  lav:"#9b87c0", lavL:"#f3f0f9",
+  orange:"#d4845a", orangeL:"#fdf1eb",
+  red:"#c46b6b", redL:"#fceaea",
+  teal:"#5a9b8f", tealL:"#edf5f4",
+  amber:"#c49a2a", amberL:"#fdf8eb",
+  shadow:"0 1px 4px rgba(0,0,0,0.06),0 1px 2px rgba(0,0,0,0.04)",
+  shadowMd:"0 4px 20px rgba(0,0,0,0.09)",
+  shadowLg:"0 8px 40px rgba(0,0,0,0.13)",
+};
+
+const ALL_TASKS = [
+  {key:"achat",    label:"Achat",    icon:"🛒"},
+  {key:"ventes",   label:"Ventes",   icon:"💰"},
+  {key:"pointage", label:"Pointage", icon:"🎯"},
+  {key:"caisse",   label:"Caisse",   icon:"🗃️"},
+  {key:"paie",     label:"Paie",     icon:"💼"},
+  {key:"lettrage", label:"Lettrage", icon:"✉️"},
+  {key:"pes",      label:"PES",      icon:"📤"},
+];
+const MONTHS_FR  = ["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
+const DAYS_SHORT = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"];
+const TVA_QUARTERS = [1,4,7,10];
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const todayStr = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+};
+const getCurrentMonthKey = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+};
+const currentMonthFr = () => {
+  const d = new Date();
+  return `${MONTHS_FR[d.getMonth()]} ${d.getFullYear()}`;
+};
+const monthKeyToFr = mk => {
+  if (!mk) return "—";
+  const [y, m] = mk.split("-");
+  return `${MONTHS_FR[parseInt(m)-1]} ${y}`;
+};
+const ordinal = n => n===1?"1er":`${n}`;
+const fmtDate = ds => {
+  if (!ds) return "—";
+  const [y,m,d] = ds.split("-");
+  return `${d}/${m}/${y}`;
+};
+
+// Annuel = pas de TVA
+const hasTVA = row => (row.regime||"mensuel") !== "annuel";
+
+// ─── TVA helpers ──────────────────────────────────────────────────────────────
+const getNextTVADate = (row, refDateStr) => {
+  if (!hasTVA(row)||!refDateStr||!row.tvaDayOfMonth) return null;
+  const ref = new Date(refDateStr); ref.setHours(0,0,0,0);
+  const day = parseInt(row.tvaDayOfMonth);
+  const regime = row.regime||"mensuel";
+
+  if (regime==="mensuel") {
+    const last = new Date(ref.getFullYear(),ref.getMonth()+1,0).getDate();
+    const tgt  = new Date(ref.getFullYear(),ref.getMonth(),Math.min(day,last));
+    tgt.setHours(0,0,0,0); return tgt;
+  }
+  if (regime==="trimestriel") {
+    const refM = ref.getMonth()+1;
+    let qM = TVA_QUARTERS.find(m=>m>=refM), qY=ref.getFullYear();
+    if(!qM){qM=TVA_QUARTERS[0];qY++;}
+    const last=new Date(qY,qM,0).getDate();
+    let tgt=new Date(qY,qM-1,Math.min(day,last)); tgt.setHours(0,0,0,0);
+    if(tgt<ref){
+      const idx=TVA_QUARTERS.indexOf(qM);
+      const ni=(idx+1)%TVA_QUARTERS.length;
+      qM=TVA_QUARTERS[ni]; if(ni===0)qY++;
+      const last2=new Date(qY,qM,0).getDate();
+      tgt=new Date(qY,qM-1,Math.min(day,last2)); tgt.setHours(0,0,0,0);
+    }
+    return tgt;
+  }
+  return null;
+};
+const daysUntilNext = (row,refDateStr) => {
+  const tgt=getNextTVADate(row,refDateStr);
+  if(!tgt||!refDateStr) return null;
+  const ref=new Date(refDateStr); ref.setHours(0,0,0,0);
+  return Math.ceil((tgt-ref)/86400000);
+};
+
+// ─── Compta helpers ───────────────────────────────────────────────────────────
+const defaultTasksEnabled = () => Object.fromEntries(ALL_TASKS.map(t=>[t.key,true]));
+const getComptaStatus = row => {
+  const en=ALL_TASKS.filter(t=>row.tasksEnabled?.[t.key]);
+  if(!en.length) return "none";
+  const done=en.filter(t=>row.tasksDone?.[t.key]);
+  if(!done.length) return "todo";
+  if(done.length===en.length) return "done";
+  return "progress";
+};
+const getRowStatus = (row,refDate) => {
+  if(!row.docsRecu) return "nodoc";
+  if(getComptaStatus(row)==="done") return "done";
+  return "progress";
+};
+
+// ─── Storage ──────────────────────────────────────────────────────────────────
+const STORAGE_KEY = "compta_pro_v7";
+const loadData = () => { try{const r=localStorage.getItem(STORAGE_KEY);return r?JSON.parse(r):null;}catch{return null;} };
+const saveData = d => { try{localStorage.setItem(STORAGE_KEY,JSON.stringify(d));}catch{} };
+
+// Archive le mois écoulé et repart à zéro sur docs + tâches. Relances conservées.
+const applyMonthlyReset = (rows, lastMonth) =>
+  rows.map(row => ({
+    ...row,
+    monthHistory: [
+      ...(row.monthHistory||[]),
+      { month: lastMonth,
+        docsRecu: row.docsRecu,
+        tasksDone: {...(row.tasksDone||{})},
+        relances: [...(row.relances||[])] }
+    ],
+    docsRecu: false,
+    tasksDone: {},
+    // relances : on conserve — elles s'accumulent
+  }));
+
+const SAMPLE_DATA = [
+  { id:1, client:"Dupont SARL", regime:"mensuel", tvaDayOfMonth:19,
+    docsRecu:true, periode:"Mars 2026",
+    tasksEnabled:{achat:true,ventes:true,pointage:true,caisse:false,paie:true,lettrage:true,pes:false},
+    tasksDone:{achat:true,ventes:true,pointage:false,paie:false,lettrage:false},
+    notes:"Attente relevé banque",
+    relances:[
+      {id:1,date:"2026-03-01",note:"Email envoyé pour les relevés bancaires"},
+      {id:2,date:"2026-03-05",note:"Rappel tél. — promesse de documents pour le 10"},
+    ], monthHistory:[] },
+  { id:2, client:"Martin & Associés", regime:"trimestriel", tvaDayOfMonth:24,
+    docsRecu:true, periode:"Mars 2026",
+    tasksEnabled:{achat:true,ventes:true,pointage:true,caisse:true,paie:true,lettrage:true,pes:true},
+    tasksDone:{}, notes:"",
+    relances:[], monthHistory:[] },
+  { id:3, client:"Lefebvre SAS", regime:"mensuel", tvaDayOfMonth:2,
+    docsRecu:false, periode:"Mars 2026",
+    tasksEnabled:defaultTasksEnabled(),
+    tasksDone:{achat:true,ventes:true,pointage:true,caisse:true,paie:true,lettrage:true,pes:true},
+    notes:"Client en déplacement",
+    relances:[{id:1,date:"2026-03-03",note:"Laissé un message vocal"}],
+    monthHistory:[
+      { month:"2026-02", docsRecu:true,
+        tasksDone:{achat:true,ventes:true,pointage:true,caisse:true,paie:true,lettrage:true,pes:true},
+        relances:[{id:10,date:"2026-02-05",note:"Documents reçus par email"}] },
+      { month:"2026-01", docsRecu:true,
+        tasksDone:{achat:true,ventes:true,pointage:true,caisse:true,paie:false,lettrage:true,pes:true},
+        relances:[] },
+    ] },
+  { id:4, client:"Rousseau & Fils", regime:"mensuel", tvaDayOfMonth:15,
+    docsRecu:true, periode:"Mars 2026",
+    tasksEnabled:{achat:true,ventes:true,pointage:false,caisse:false,paie:true,lettrage:true,pes:true},
+    tasksDone:{achat:true,ventes:true,paie:true,lettrage:true,pes:true},
+    notes:"Complet ✓", relances:[], monthHistory:[] },
+  { id:5, client:"Benoit Consulting", regime:"annuel", tvaDayOfMonth:null,
+    docsRecu:true, periode:"Mars 2026",
+    tasksEnabled:{achat:true,ventes:true,pointage:false,caisse:false,paie:false,lettrage:true,pes:false},
+    tasksDone:{achat:true,ventes:true,lettrage:false},
+    notes:"Bilan annuel — pas de TVA mensuelle",
+    relances:[{id:1,date:"2026-02-20",note:"Confirmation RDV bilan annuel"}],
+    monthHistory:[] },
+];
+
+// ─── CSV ──────────────────────────────────────────────────────────────────────
+const exportCSV = (rows, refDate) => {
+  const h=["Client","Période","Docs","Compta","Régime","Prochain TVA","Jours rest.","Dernière relance","Notes"];
+  const lines=[h.join(";"), ...rows.map(r=>{
+    const cs=getComptaStatus(r);
+    const csl=cs==="done"?"Validé":cs==="progress"?"En cours":cs==="todo"?"Non commencé":"—";
+    const tgt=getNextTVADate(r,refDate);
+    const days=daysUntilNext(r,refDate);
+    const lastRel=[...(r.relances||[])].sort((a,b)=>b.date.localeCompare(a.date))[0];
+    const tvaStr=!hasTVA(r)?"Annuel (sans TVA)":
+      tgt?`${String(tgt.getDate()).padStart(2,"0")}/${String(tgt.getMonth()+1).padStart(2,"0")}/${tgt.getFullYear()}`:"—";
+    return [r.client,r.periode,r.docsRecu?"Oui":"Non",csl,r.regime||"mensuel",tvaStr,
+      days!==null?days:"—",lastRel?fmtDate(lastRel.date):"—",r.notes||""]
+      .map(v=>`"${String(v).replace(/"/g,'""')}"`).join(";");
+  })];
+  const blob=new Blob(["\uFEFF"+lines.join("\n")],{type:"text/csv;charset=utf-8;"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");a.href=url;a.download="dossiers.csv";a.click();
+  URL.revokeObjectURL(url);
+};
+
+// ─── ComptaStatus ─────────────────────────────────────────────────────────────
+function ComptaStatus({row}){
+  const cs=getComptaStatus(row);
+  const en=ALL_TASKS.filter(t=>row.tasksEnabled?.[t.key]);
+  const done=en.filter(t=>row.tasksDone?.[t.key]);
+  if(cs==="none") return <span style={{color:C.light,fontSize:12}}>Aucune tâche</span>;
+  if(cs==="todo") return(
+    <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",
+      borderRadius:99,background:"#f0eeeb",color:C.muted,fontSize:11.5,fontWeight:700}}>
+      <span style={{width:6,height:6,borderRadius:"50%",background:C.light,display:"inline-block"}}/>Non commencé
+    </span>);
+  if(cs==="done") return(
+    <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",
+      borderRadius:99,background:C.sageL,color:C.sageD,fontSize:11.5,fontWeight:700}}>
+      <span style={{width:6,height:6,borderRadius:"50%",background:C.sage,display:"inline-block"}}/>Validé
+    </span>);
+  return(
+    <div style={{display:"flex",flexDirection:"column",gap:3}}>
+      <span style={{display:"inline-flex",alignItems:"center",gap:4,padding:"3px 10px",
+        borderRadius:99,background:C.lavL,color:"#7a6aa0",fontSize:11.5,fontWeight:700,width:"fit-content"}}>
+        <span style={{width:6,height:6,borderRadius:"50%",background:C.lav,display:"inline-block"}}/>En cours
+      </span>
+      <div style={{fontSize:10.5,color:C.muted,paddingLeft:2}}>{done.length}/{en.length} tâches</div>
+    </div>);
+}
+
+function DaysChip({days}){
+  if(days===null||days===undefined) return <span style={{color:C.light}}>—</span>;
+  if(days<0) return <span style={{color:C.muted,fontSize:12}}>{Math.abs(days)}j dépassé</span>;
+  if(days===0) return <span style={{color:C.muted,fontSize:12}}>Aujourd'hui</span>;
+  return <span style={{color:C.muted,fontSize:12}}>{days}j restant</span>;
+}
+
+function StatCard({icon,label,value,sub,color}){
+  return(
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:"18px 22px",
+      boxShadow:C.shadow,flex:1,minWidth:120}}>
+      <div style={{fontSize:22,marginBottom:8}}>{icon}</div>
+      <div style={{fontSize:26,fontWeight:700,fontFamily:"'Lora',serif",color:color||C.text,lineHeight:1}}>{value}</div>
+      <div style={{fontSize:12,fontWeight:600,color:C.muted,marginTop:4}}>{label}</div>
+      {sub&&<div style={{fontSize:11,color:C.light,marginTop:2}}>{sub}</div>}
+    </div>);
+}
+
+// ─── Compta Modal ─────────────────────────────────────────────────────────────
+function ComptaModal({row,onClose,onUpdate}){
+  const [tasksDone,setTasksDone]=useState({...(row.tasksDone||{})});
+  const en=ALL_TASKS.filter(t=>row.tasksEnabled?.[t.key]);
+  const toggle=key=>{const n={...tasksDone,[key]:!tasksDone[key]};setTasksDone(n);onUpdate(row.id,n);};
+  const cnt=en.filter(t=>tasksDone[t.key]).length;
+  const pct=en.length?Math.round(cnt/en.length*100):0;
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(30,25,20,.45)",zIndex:1000,display:"flex",
+      alignItems:"center",justifyContent:"center",backdropFilter:"blur(3px)"}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.card,borderRadius:20,padding:"30px 34px",width:420,maxWidth:"95vw",
+        boxShadow:C.shadowLg,animation:"slideUp .22s ease"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:22}}>
+          <div>
+            <div style={{fontFamily:"'Lora',serif",fontSize:18,fontWeight:600,fontStyle:"italic"}}>Comptabilité</div>
+            <div style={{fontSize:13,color:C.muted,marginTop:2,fontWeight:600}}>{row.client}</div>
+          </div>
+          <button onClick={onClose} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,
+            width:32,height:32,cursor:"pointer",fontSize:16,color:C.muted,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+        <div style={{marginBottom:22}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:7}}>
+            <span style={{fontSize:12,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8}}>Avancement</span>
+            <span style={{fontSize:18,fontWeight:700,fontFamily:"'Lora',serif",color:pct===100?C.sage:C.text}}>{pct}%</span>
+          </div>
+          <div style={{background:C.border,borderRadius:99,height:6}}>
+            <div style={{height:6,borderRadius:99,width:`${pct}%`,transition:"width .4s ease",
+              background:pct===100?`linear-gradient(90deg,${C.sage},#a8c9b0)`:`linear-gradient(90deg,${C.lav},${C.blue})`}}/>
+          </div>
+          <div style={{fontSize:11,color:C.light,marginTop:5}}>{cnt}/{en.length} tâches complétées</div>
+        </div>
+        {en.length===0?(
+          <div style={{textAlign:"center",color:C.light,fontSize:13,padding:"20px 0"}}>Aucune tâche configurée.</div>
+        ):(
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {en.map(task=>{
+              const done=!!tasksDone[task.key];
+              return(
+                <div key={task.key} onClick={()=>toggle(task.key)}
+                  style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+                    padding:"12px 16px",borderRadius:12,cursor:"pointer",transition:"all .16s",
+                    background:done?C.sageL:C.bg,border:`1.5px solid ${done?"#cde0d3":C.border}`}}>
+                  <div style={{display:"flex",alignItems:"center",gap:10}}>
+                    <span style={{fontSize:18}}>{task.icon}</span>
+                    <span style={{fontSize:14,fontWeight:600,color:done?C.sageD:C.text}}>{task.label}</span>
+                  </div>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    {done&&<span style={{fontSize:11,color:C.sage,fontWeight:700}}>Fait</span>}
+                    <div style={{width:34,height:19,borderRadius:99,background:done?C.sage:C.border,
+                      position:"relative",flexShrink:0,transition:"all .22s"}}>
+                      <div style={{position:"absolute",top:3,left:done?18:3,width:13,height:13,borderRadius:"50%",
+                        background:"#fff",boxShadow:"0 1px 3px rgba(0,0,0,.18)",transition:"left .22s"}}/>
+                    </div>
+                  </div>
+                </div>);
+            })}
+          </div>
+        )}
+        <div style={{marginTop:20,textAlign:"right"}}>
+          <button onClick={onClose} style={{padding:"9px 22px",borderRadius:10,border:"none",background:C.sage,
+            color:"#fff",fontWeight:700,fontSize:14,fontFamily:"'Nunito',sans-serif",cursor:"pointer"}}>Fermer</button>
+        </div>
+      </div>
+    </div>);
+}
+
+// ─── History Modal ─────────────────────────────────────────────────────────────
+function HistoryModal({row,onClose}){
+  const history=[...(row.monthHistory||[])].sort((a,b)=>b.month.localeCompare(a.month));
+  const [sel,setSel]=useState(history[0]?.month||null);
+  const entry=history.find(h=>h.month===sel)||null;
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(30,25,20,.45)",zIndex:1000,display:"flex",
+      alignItems:"center",justifyContent:"center",backdropFilter:"blur(3px)"}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.card,borderRadius:20,padding:"30px 32px",width:580,maxWidth:"95vw",
+        maxHeight:"88vh",display:"flex",flexDirection:"column",boxShadow:C.shadowLg,animation:"slideUp .22s ease"}}>
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+          <div>
+            <div style={{fontFamily:"'Lora',serif",fontSize:18,fontWeight:600,fontStyle:"italic"}}>🕓 Historique mensuel</div>
+            <div style={{fontSize:13,color:C.muted,marginTop:2,fontWeight:600}}>{row.client}</div>
+          </div>
+          <button onClick={onClose} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,
+            width:32,height:32,cursor:"pointer",fontSize:16,color:C.muted,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+
+        {history.length===0?(
+          <div style={{flex:1,display:"flex",alignItems:"center",justifyContent:"center",
+            flexDirection:"column",gap:8,color:C.light,fontSize:13,textAlign:"center",padding:"40px 0"}}>
+            <span style={{fontSize:32}}>🕓</span>
+            Aucun historique disponible pour l'instant.<br/>
+            <span style={{fontSize:11,marginTop:4}}>Il se construira automatiquement à la fin du mois.</span>
+          </div>
+        ):(
+          <div style={{display:"flex",gap:16,flex:1,minHeight:0}}>
+            {/* Sélecteur mois */}
+            <div style={{display:"flex",flexDirection:"column",gap:4,width:155,flexShrink:0,overflowY:"auto"}}>
+              {history.map(h=>{
+                const cs=Object.values(h.tasksDone||{}).filter(Boolean).length;
+                const en=ALL_TASKS.filter(t=>row.tasksEnabled?.[t.key]).length;
+                const done=en>0&&cs===en;
+                return(
+                  <button key={h.month} onClick={()=>setSel(h.month)}
+                    style={{padding:"9px 12px",borderRadius:10,textAlign:"left",cursor:"pointer",fontFamily:"inherit",
+                      border:`1.5px solid ${sel===h.month?C.sage:C.border}`,
+                      background:sel===h.month?C.sageL:C.bg,
+                      color:sel===h.month?C.sageD:C.muted,transition:"all .15s"}}>
+                    <div style={{fontSize:13,fontWeight:700}}>{monthKeyToFr(h.month)}</div>
+                    <div style={{fontSize:10.5,marginTop:2,color:sel===h.month?C.sage:C.light}}>
+                      {done?"✓ Compta OK":h.docsRecu?`${cs}/${en} tâches`:"Docs manquants"}
+                    </div>
+                  </button>);
+              })}
+            </div>
+
+            {/* Détail */}
+            {entry&&(
+              <div style={{flex:1,overflowY:"auto",display:"flex",flexDirection:"column",gap:16}}>
+
+                {/* Docs */}
+                <div style={{display:"inline-flex",alignItems:"center",gap:7,padding:"7px 14px",
+                  borderRadius:20,fontSize:12.5,fontWeight:700,width:"fit-content",
+                  background:entry.docsRecu?C.sageL:"#f0eeeb",
+                  color:entry.docsRecu?C.sageD:C.muted,
+                  border:`1px solid ${entry.docsRecu?"#cde0d3":C.border}`}}>
+                  {entry.docsRecu?"✓ Documents reçus":"○ Documents non reçus"}
+                </div>
+
+                {/* Tâches */}
+                <div>
+                  <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",
+                    letterSpacing:.8,marginBottom:8}}>Tâches comptables</div>
+                  <div style={{display:"flex",flexDirection:"column",gap:5}}>
+                    {ALL_TASKS.filter(t=>row.tasksEnabled?.[t.key]).map(task=>{
+                      const done=!!entry.tasksDone?.[task.key];
+                      return(
+                        <div key={task.key} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",
+                          borderRadius:9,background:done?C.sageL:"#f5f4f2",
+                          border:`1px solid ${done?"#cde0d3":C.borderL}`}}>
+                          <span style={{fontSize:15}}>{task.icon}</span>
+                          <span style={{fontSize:13,fontWeight:600,color:done?C.sageD:C.muted,flex:1}}>{task.label}</span>
+                          <span style={{fontSize:12,fontWeight:700,color:done?C.sage:C.light}}>{done?"✓ Fait":"—"}</span>
+                        </div>);
+                    })}
+                  </div>
+                </div>
+
+                {/* Relances archivées de ce mois */}
+                <div>
+                  <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",
+                    letterSpacing:.8,marginBottom:8}}>
+                    Relances ce mois ({(entry.relances||[]).length})
+                  </div>
+                  {(entry.relances||[]).length===0?(
+                    <div style={{fontSize:12,color:C.light}}>Aucune relance enregistrée ce mois-là.</div>
+                  ):(
+                    <div style={{display:"flex",flexDirection:"column",gap:0}}>
+                      {[...entry.relances].sort((a,b)=>b.date.localeCompare(a.date)).map((r,i)=>(
+                        <div key={r.id} style={{display:"flex",gap:10,padding:"9px 0",
+                          borderBottom:i<entry.relances.length-1?`1px solid ${C.borderL}`:"none"}}>
+                          <div style={{flexShrink:0,paddingTop:5}}>
+                            <div style={{width:7,height:7,borderRadius:"50%",background:C.blue}}/>
+                          </div>
+                          <div>
+                            <div style={{fontSize:11,fontWeight:700,color:C.muted,marginBottom:2}}>{fmtDate(r.date)}</div>
+                            <div style={{fontSize:13,color:C.text,lineHeight:1.5}}>{r.note}</div>
+                          </div>
+                        </div>))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div style={{marginTop:20,textAlign:"right"}}>
+          <button onClick={onClose} style={{padding:"9px 22px",borderRadius:10,border:"none",background:C.sage,
+            color:"#fff",fontWeight:700,fontSize:14,fontFamily:"'Nunito',sans-serif",cursor:"pointer"}}>Fermer</button>
+        </div>
+      </div>
+    </div>);
+}
+
+// ─── Relances Modal ───────────────────────────────────────────────────────────
+function RelancesModal({row,onClose,onUpdate}){
+  const [relances,setRelances]=useState([...(row.relances||[])]);
+  const [note,setNote]=useState("");
+  const [date,setDate]=useState(todayStr());
+  const add=()=>{
+    if(!note.trim()) return;
+    const n=[...relances,{id:Date.now(),date,note:note.trim()}];
+    setRelances(n);onUpdate(row.id,n);setNote("");
+  };
+  const remove=id=>{const n=relances.filter(r=>r.id!==id);setRelances(n);onUpdate(row.id,n);};
+  const inp={width:"100%",background:C.bg,border:`1.5px solid ${C.border}`,borderRadius:9,
+    padding:"8px 11px",color:C.text,fontSize:13.5,fontFamily:"inherit",outline:"none",transition:"border .15s"};
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(30,25,20,.45)",zIndex:1000,display:"flex",
+      alignItems:"center",justifyContent:"center",backdropFilter:"blur(3px)"}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.card,borderRadius:20,padding:"30px 32px",width:480,maxWidth:"95vw",
+        maxHeight:"85vh",display:"flex",flexDirection:"column",boxShadow:C.shadowLg,animation:"slideUp .22s ease"}}>
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:20}}>
+          <div>
+            <div style={{fontFamily:"'Lora',serif",fontSize:18,fontWeight:600,fontStyle:"italic"}}>📞 Relances</div>
+            <div style={{fontSize:13,color:C.muted,marginTop:2,fontWeight:600}}>{row.client}</div>
+          </div>
+          <button onClick={onClose} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,
+            width:32,height:32,cursor:"pointer",fontSize:16,color:C.muted,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+
+        <div style={{background:C.bg,borderRadius:12,padding:"14px 16px",marginBottom:18,border:`1px solid ${C.border}`}}>
+          <div style={{fontSize:11,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8,marginBottom:10}}>
+            Nouvelle relance
+          </div>
+          <div style={{marginBottom:8}}>
+            <input type="date" value={date} onChange={e=>setDate(e.target.value)}
+              style={{...inp,width:"auto"}}
+              onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+          </div>
+          <div style={{display:"flex",gap:8}}>
+            <input value={note} onChange={e=>setNote(e.target.value)}
+              placeholder="Ex : Email envoyé pour les relevés…"
+              onKeyDown={e=>e.key==="Enter"&&add()}
+              style={{...inp,flex:1}}
+              onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+            <button onClick={add} disabled={!note.trim()}
+              style={{padding:"8px 16px",borderRadius:9,border:"none",
+                background:note.trim()?C.sage:C.border,color:note.trim()?"#fff":C.muted,
+                fontWeight:700,fontSize:13,fontFamily:"inherit",cursor:note.trim()?"pointer":"not-allowed",whiteSpace:"nowrap"}}>
+              + Ajouter
+            </button>
+          </div>
+        </div>
+
+        <div style={{overflowY:"auto",flex:1}}>
+          {relances.length===0?(
+            <div style={{textAlign:"center",color:C.light,fontSize:13,padding:"30px 0"}}>Aucune relance enregistrée.</div>
+          ):(
+            <div>
+              {[...relances].sort((a,b)=>b.date.localeCompare(a.date)).map((r,i)=>(
+                <div key={r.id} style={{display:"flex",gap:12,padding:"12px 0",
+                  borderBottom:i<relances.length-1?`1px solid ${C.borderL}`:"none"}}>
+                  <div style={{flexShrink:0,display:"flex",flexDirection:"column",alignItems:"center",gap:4}}>
+                    <div style={{width:8,height:8,borderRadius:"50%",background:C.blue,marginTop:5}}/>
+                    {i<relances.length-1&&<div style={{width:1,flex:1,background:C.borderL}}/>}
+                  </div>
+                  <div style={{flex:1,minWidth:0}}>
+                    <div style={{fontSize:11,fontWeight:700,color:C.muted,marginBottom:3}}>{fmtDate(r.date)}</div>
+                    <div style={{fontSize:13.5,color:C.text,lineHeight:1.5}}>{r.note}</div>
+                  </div>
+                  <button onClick={()=>remove(r.id)}
+                    style={{flexShrink:0,background:"transparent",border:"none",cursor:"pointer",
+                      color:C.light,fontSize:14,padding:"2px 4px",alignSelf:"flex-start",marginTop:2}}>✕</button>
+                </div>))}
+            </div>
+          )}
+        </div>
+
+        <div style={{marginTop:16,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <div style={{fontSize:11,color:C.light}}>
+            Les relances sont conservées d'un mois à l'autre et archivées dans l'historique.
+          </div>
+          <button onClick={onClose} style={{padding:"9px 22px",borderRadius:10,border:"none",background:C.sage,
+            color:"#fff",fontWeight:700,fontSize:14,fontFamily:"'Nunito',sans-serif",cursor:"pointer",flexShrink:0}}>Fermer</button>
+        </div>
+      </div>
+    </div>);
+}
+
+// ─── Dossier Modal ─────────────────────────────────────────────────────────────
+const EMPTY_FORM = ()=>({
+  id:null,client:"",periode:currentMonthFr(),docsRecu:false,
+  regime:"mensuel",tvaDayOfMonth:"",
+  tasksEnabled:defaultTasksEnabled(),tasksDone:{},notes:"",
+  relances:[],monthHistory:[],
+});
+
+function DossierModal({form,setForm,onSave,onClose,isEdit}){
+  const inp={width:"100%",background:C.bg,border:`1.5px solid ${C.border}`,borderRadius:9,
+    padding:"9px 12px",color:C.text,fontSize:14,fontFamily:"inherit",outline:"none",transition:"border .15s"};
+  const Field=({label,children,col2})=>(
+    <div style={{marginBottom:18,...(col2?{gridColumn:"1/-1"}:{})}}>
+      <label style={{display:"block",fontSize:11.5,fontWeight:700,color:C.muted,
+        textTransform:"uppercase",letterSpacing:.8,marginBottom:6}}>{label}</label>
+      {children}
+    </div>);
+  const tva=hasTVA(form);
+
+  return(
+    <div style={{position:"fixed",inset:0,background:"rgba(30,25,20,.45)",zIndex:1000,display:"flex",
+      alignItems:"center",justifyContent:"center",backdropFilter:"blur(3px)"}}
+      onClick={e=>e.target===e.currentTarget&&onClose()}>
+      <div style={{background:C.card,borderRadius:20,padding:"32px 36px",width:580,maxWidth:"95vw",
+        maxHeight:"90vh",overflowY:"auto",boxShadow:C.shadowLg,animation:"slideUp .22s ease"}}>
+
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:26}}>
+          <div style={{fontFamily:"'Lora',serif",fontSize:20,fontWeight:600,fontStyle:"italic"}}>
+            {isEdit?"Modifier le dossier":"Nouveau dossier"}
+          </div>
+          <button onClick={onClose} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,
+            width:32,height:32,cursor:"pointer",fontSize:16,color:C.muted,display:"flex",alignItems:"center",justifyContent:"center"}}>✕</button>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0 20px"}}>
+          <Field label="Nom du client *" col2>
+            <input value={form.client} onChange={e=>setForm(f=>({...f,client:e.target.value}))}
+              placeholder="ex : Dupont SARL" style={inp}
+              onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+          </Field>
+          <Field label="Période">
+            <input value={form.periode} onChange={e=>setForm(f=>({...f,periode:e.target.value}))}
+              placeholder="ex : Mars 2026" style={inp}
+              onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+          </Field>
+
+          <Field label="Régime">
+            <div style={{display:"flex",gap:6}}>
+              {["mensuel","trimestriel","annuel"].map(r=>(
+                <button key={r} onClick={()=>setForm(f=>({...f,regime:r,tvaDayOfMonth:r==="annuel"?"":f.tvaDayOfMonth}))}
+                  style={{flex:1,padding:"8px 6px",borderRadius:8,
+                    border:`1.5px solid ${form.regime===r?C.sage:C.border}`,
+                    background:form.regime===r?C.sageL:C.bg,
+                    color:form.regime===r?C.sageD:C.muted,
+                    fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"inherit",transition:"all .15s"}}>
+                  {r==="mensuel"?"Mensuel":r==="trimestriel"?"Trim.":"Annuel"}
+                </button>))}
+            </div>
+            {form.regime==="annuel"&&(
+              <div style={{marginTop:8,padding:"8px 12px",borderRadius:8,
+                background:C.amberL,border:`1px solid ${C.amber}44`,fontSize:12,color:C.amber}}>
+                ℹ️ Régime simplifié annuel — pas de déclaration TVA mensuelle
+              </div>)}
+          </Field>
+
+          {tva&&(
+            <Field label="Jour TVA du mois (1–31)">
+              <input type="number" min="1" max="31" value={form.tvaDayOfMonth}
+                onChange={e=>{const v=e.target.value;if(v===""){setForm(f=>({...f,tvaDayOfMonth:""}));return;}
+                  setForm(f=>({...f,tvaDayOfMonth:Math.min(31,Math.max(1,parseInt(v)||1))}));}}
+                placeholder="ex : 10" style={inp}
+                onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+              {form.tvaDayOfMonth&&(
+                <div style={{fontSize:11,color:C.muted,marginTop:4}}>
+                  {form.regime==="mensuel"&&`Chaque mois le ${ordinal(form.tvaDayOfMonth)}`}
+                  {form.regime==="trimestriel"&&`Chaque trimestre le ${ordinal(form.tvaDayOfMonth)} (janv., avr., juil., oct.)`}
+                </div>)}
+            </Field>)}
+        </div>
+
+        {/* Docs */}
+        <div style={{display:"flex",alignItems:"center",gap:12,padding:"12px 16px",
+          background:form.docsRecu?C.blueL:C.bg,border:`1.5px solid ${form.docsRecu?C.blue:C.border}`,
+          borderRadius:12,marginBottom:18,cursor:"pointer",transition:"all .18s"}}
+          onClick={()=>setForm(f=>({...f,docsRecu:!f.docsRecu}))}>
+          <div style={{width:40,height:22,borderRadius:99,background:form.docsRecu?C.blue:C.border,
+            position:"relative",flexShrink:0,transition:"all .22s",cursor:"pointer"}}>
+            <div style={{position:"absolute",top:3,left:form.docsRecu?21:3,width:16,height:16,borderRadius:"50%",
+              background:"#fff",boxShadow:"0 1px 3px rgba(0,0,0,.18)",transition:"left .22s"}}/>
+          </div>
+          <span style={{fontSize:14,fontWeight:600,color:form.docsRecu?C.blue:C.muted}}>📥 Documents reçus</span>
+        </div>
+
+        {/* Tâches */}
+        <div style={{marginBottom:18}}>
+          <div style={{fontSize:11.5,fontWeight:700,color:C.muted,textTransform:"uppercase",letterSpacing:.8,marginBottom:10}}>
+            Tâches comptables
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {ALL_TASKS.map(task=>{
+              const active=!!form.tasksEnabled?.[task.key];
+              return(
+                <div key={task.key}
+                  onClick={()=>setForm(f=>({...f,tasksEnabled:{...f.tasksEnabled,[task.key]:!f.tasksEnabled?.[task.key]}}))}
+                  style={{display:"flex",alignItems:"center",gap:10,padding:"10px 14px",borderRadius:10,
+                    cursor:"pointer",transition:"all .15s",background:active?C.sageL:C.bg,
+                    border:`1.5px solid ${active?"#cde0d3":C.border}`}}>
+                  <div style={{width:18,height:18,borderRadius:5,border:`2px solid ${active?C.sage:C.border}`,
+                    background:active?C.sage:"transparent",display:"flex",alignItems:"center",justifyContent:"center",
+                    flexShrink:0,transition:"all .15s"}}>
+                    {active&&<span style={{color:"#fff",fontSize:11,fontWeight:900}}>✓</span>}
+                  </div>
+                  <span style={{fontSize:13}}>{task.icon}</span>
+                  <span style={{fontSize:13.5,fontWeight:600,color:active?C.sageD:C.muted}}>{task.label}</span>
+                </div>);
+            })}
+          </div>
+        </div>
+
+        {/* Notes */}
+        <div style={{marginBottom:22}}>
+          <label style={{display:"block",fontSize:11.5,fontWeight:700,color:C.muted,
+            textTransform:"uppercase",letterSpacing:.8,marginBottom:6}}>Notes</label>
+          <textarea value={form.notes} onChange={e=>setForm(f=>({...f,notes:e.target.value}))}
+            placeholder="Informations complémentaires…" rows={3}
+            style={{...inp,resize:"vertical",lineHeight:1.55}}
+            onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+        </div>
+
+        <div style={{display:"flex",gap:10,justifyContent:"flex-end"}}>
+          <button onClick={onClose} style={{padding:"10px 20px",borderRadius:10,border:`1px solid ${C.border}`,
+            background:"transparent",cursor:"pointer",color:C.muted,fontSize:14,fontFamily:"inherit",fontWeight:600}}>Annuler</button>
+          <button onClick={onSave} disabled={!form.client.trim()}
+            style={{padding:"10px 24px",borderRadius:10,border:"none",
+              background:form.client.trim()?C.sage:C.border,
+              cursor:form.client.trim()?"pointer":"not-allowed",
+              color:form.client.trim()?"#fff":C.muted,
+              fontSize:14,fontFamily:"inherit",fontWeight:700,
+              boxShadow:form.client.trim()?`0 3px 10px ${C.sage}44`:"none"}}>
+            {isEdit?"Enregistrer":"Ajouter le dossier"}
+          </button>
+        </div>
+      </div>
+    </div>);
+}
+
+// ─── Notes hover ──────────────────────────────────────────────────────────────
+function NotesCell({notes}){
+  const [open,setOpen]=useState(false);
+  if(!notes) return <span style={{color:C.light,fontSize:12}}>—</span>;
+  return(
+    <div style={{position:"relative",display:"inline-block"}}
+      onMouseEnter={()=>setOpen(true)} onMouseLeave={()=>setOpen(false)}>
+      <span style={{cursor:"default",color:C.blue,fontSize:12,fontWeight:600,
+        borderBottom:`1px dashed ${C.blue}`,userSelect:"none"}}>Note</span>
+      {open&&(
+        <div style={{position:"absolute",bottom:"calc(100% + 8px)",left:0,zIndex:200,
+          background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",
+          minWidth:180,maxWidth:260,fontSize:12.5,color:C.text,boxShadow:C.shadowMd,
+          lineHeight:1.55,whiteSpace:"pre-wrap",pointerEvents:"none"}}>
+          {notes}
+          <div style={{position:"absolute",bottom:-6,left:14,width:10,height:10,background:C.card,
+            border:`1px solid ${C.border}`,borderTop:"none",borderLeft:"none",
+            transform:"rotate(45deg)",borderRadius:1}}/>
+        </div>)}
+    </div>);
+}
+
+// ─── Calendar View ────────────────────────────────────────────────────────────
+function CalendarView({rows,refDate}){
+  const ref0=new Date(refDate);ref0.setHours(0,0,0,0);
+  const [cy,setCy]=useState(ref0.getFullYear());
+  const [cm,setCm]=useState(ref0.getMonth());
+  const todayD=new Date();todayD.setHours(0,0,0,0);
+  const prevMonth=()=>{if(cm===0){setCy(y=>y-1);setCm(11);}else setCm(m=>m-1);};
+  const nextMonth=()=>{if(cm===11){setCy(y=>y+1);setCm(0);}else setCm(m=>m+1);};
+  const daysInMonth=new Date(cy,cm+1,0).getDate();
+  const firstDow=(new Date(cy,cm,1).getDay()+6)%7;
+  const cells=[];
+  for(let i=0;i<firstDow;i++) cells.push(null);
+  for(let d=1;d<=daysInMonth;d++) cells.push(d);
+  const calRef=`${cy}-${String(cm+1).padStart(2,"0")}-01`;
+  const dayMap={};
+  rows.filter(r=>hasTVA(r)).forEach(row=>{
+    const tgt=getNextTVADate(row,calRef);
+    if(!tgt||tgt.getFullYear()!==cy||tgt.getMonth()!==cm) return;
+    const d=tgt.getDate();
+    if(!dayMap[d]) dayMap[d]=[];
+    const refD=new Date(refDate);refD.setHours(0,0,0,0);
+    dayMap[d].push({row,days:Math.ceil((tgt-refD)/86400000)});
+  });
+  const regColor={mensuel:C.blue,trimestriel:C.lav};
+  return(
+    <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,padding:"24px",boxShadow:C.shadow}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:20}}>
+        <button onClick={prevMonth} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,width:34,height:34,cursor:"pointer",fontSize:16,color:C.muted}}>‹</button>
+        <div style={{fontFamily:"'Lora',serif",fontSize:18,fontWeight:600}}>{MONTHS_FR[cm]} {cy}</div>
+        <button onClick={nextMonth} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,width:34,height:34,cursor:"pointer",fontSize:16,color:C.muted}}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:6}}>
+        {DAYS_SHORT.map(d=>(
+          <div key={d} style={{textAlign:"center",fontSize:11,fontWeight:700,color:C.light,textTransform:"uppercase",letterSpacing:.8,padding:"4px 0"}}>{d}</div>))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+        {cells.map((day,i)=>{
+          if(!day) return <div key={`e${i}`}/>;
+          const isToday=day===todayD.getDate()&&cm===todayD.getMonth()&&cy===todayD.getFullYear();
+          const entries=dayMap[day]||[];
+          return(
+            <div key={day} style={{minHeight:70,borderRadius:10,padding:"6px",
+              background:isToday?"#f0f7f2":entries.length?"#fefefe":C.bg,
+              border:`1.5px solid ${isToday?C.sage:entries.length?C.border:C.borderL}`}}>
+              <div style={{fontSize:12,fontWeight:700,color:isToday?C.sage:C.muted,marginBottom:4,textAlign:"right"}}>{day}</div>
+              <div style={{display:"flex",flexDirection:"column",gap:2}}>
+                {entries.map(({row,days})=>(
+                  <div key={row.id}
+                    title={`${row.client} — ${row.regime} — ${days>=0?`${days}j restant`:`${Math.abs(days)}j dépassé`}`}
+                    style={{fontSize:10,fontWeight:700,padding:"2px 5px",borderRadius:4,lineHeight:1.4,
+                      background:(regColor[row.regime]||C.blue)+"22",color:regColor[row.regime]||C.blue,
+                      overflow:"hidden",whiteSpace:"nowrap",textOverflow:"ellipsis",
+                      border:`1px solid ${(regColor[row.regime]||C.blue)}44`,cursor:"default"}}>
+                    {row.client.split(" ")[0]}
+                  </div>))}
+              </div>
+            </div>);
+        })}
+      </div>
+      <div style={{display:"flex",gap:16,marginTop:16,flexWrap:"wrap"}}>
+        {[{color:C.blue,label:"Mensuel"},{color:C.lav,label:"Trimestriel"}].map(({color,label})=>(
+          <div key={label} style={{display:"flex",alignItems:"center",gap:6,fontSize:11.5,color:C.muted}}>
+            <div style={{width:10,height:10,borderRadius:3,background:color+"44",border:`1.5px solid ${color}`}}/>{label}
+          </div>))}
+        <div style={{fontSize:11.5,color:C.light,marginLeft:"auto"}}>Clients annuels non affichés (pas de TVA)</div>
+      </div>
+    </div>);
+}
+
+// ─── DateRefPicker ────────────────────────────────────────────────────────────
+function DateRefPicker({refDate,setRefDate}){
+  const [editing,setEditing]=useState(false);
+  const [y,m,d]=refDate.split("-");
+  const isToday=refDate===todayStr();
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:8}}>
+      <span style={{fontSize:11,color:C.light,fontWeight:600,letterSpacing:.5}}>📅 Référence :</span>
+      {editing?(
+        <input type="date" value={refDate} autoFocus
+          onChange={e=>{setRefDate(e.target.value);setEditing(false);}}
+          onBlur={()=>setEditing(false)}
+          style={{background:C.sageL,border:`1.5px solid ${C.sage}`,borderRadius:7,
+            padding:"3px 8px",fontSize:12,fontFamily:"'Nunito',sans-serif",color:C.sageD,outline:"none"}}/>
+      ):(
+        <div style={{display:"flex",alignItems:"center",gap:6}}>
+          <span onClick={()=>setEditing(true)}
+            style={{fontSize:12.5,fontWeight:700,color:isToday?C.muted:C.orange,cursor:"pointer",
+              padding:"3px 9px",borderRadius:7,background:isToday?C.bg:C.orangeL,
+              border:`1px solid ${isToday?C.border:"#f0c8a8"}`,transition:"all .14s"}}>
+            {d}/{m}/{y}
+          </span>
+          {!isToday&&(
+            <button onClick={()=>setRefDate(todayStr())}
+              style={{fontSize:11,color:C.muted,background:"transparent",border:`1px solid ${C.border}`,
+                borderRadius:6,padding:"2px 7px",cursor:"pointer",fontFamily:"inherit"}}>
+              Aujourd'hui
+            </button>)}
+        </div>)}
+    </div>);
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+function App(){
+  const [rows,setRows]=useState(()=>{
+    const s=loadData();
+    const curM=getCurrentMonthKey();
+    if(!s) return SAMPLE_DATA;
+    if(s.lastResetMonth&&s.lastResetMonth!==curM)
+      return applyMonthlyReset(s.rows, s.lastResetMonth);
+    return s.rows;
+  });
+  const [nextId,setNextId]     =useState(()=>{const d=loadData();return d?d.nextId:SAMPLE_DATA.length+1;});
+  const [refDate,setRefDate]   =useState(()=>loadData()?.refDate||todayStr());
+  const [search,setSearch]     =useState("");
+  const [filter,setFilter]     =useState("all");
+  const [view,setView]         =useState("table");
+  const [modal,setModal]       =useState(null);
+  const [form,setForm]         =useState(EMPTY_FORM());
+  const [comptaRow,setComptaRow]   =useState(null);
+  const [relancesRow,setRelancesRow]=useState(null);
+  const [historyRow,setHistoryRow] =useState(null);
+  const [deleteId,setDeleteId] =useState(null);
+  const [sortBy,setSortBy]     =useState("client");
+  const [sortDir,setSortDir]   =useState("asc");
+
+  useEffect(()=>{saveData({rows,nextId,refDate,lastResetMonth:getCurrentMonthKey()});},[rows,nextId,refDate]);
+
+  const openAdd  =()=>{setForm(EMPTY_FORM());setModal("add");};
+  const openEdit =row=>{setForm({...row,tasksEnabled:{...row.tasksEnabled},tasksDone:{...row.tasksDone}});setModal("edit");};
+  const closeModal=()=>setModal(null);
+  const handleSave=()=>{
+    if(!form.client.trim()) return;
+    if(modal==="add"){setRows(r=>[...r,{...form,id:nextId,monthHistory:[]}]);setNextId(n=>n+1);}
+    else setRows(r=>r.map(row=>row.id===form.id?{...form,monthHistory:row.monthHistory||[]}:row));
+    closeModal();
+  };
+  const handleDelete    =()=>{setRows(r=>r.filter(row=>row.id!==deleteId));setDeleteId(null);};
+  const toggleDocs      =id=>setRows(r=>r.map(row=>row.id===id?{...row,docsRecu:!row.docsRecu}:row));
+  const updateTasksDone =(id,td)=>setRows(r=>r.map(row=>row.id===id?{...row,tasksDone:td}:row));
+  const updateRelances  =(id,rel)=>setRows(r=>r.map(row=>row.id===id?{...row,relances:rel}:row));
+
+  const stats=useMemo(()=>({
+    total:    rows.length,
+    done:     rows.filter(r=>getRowStatus(r,refDate)==="done").length,
+    progress: rows.filter(r=>getComptaStatus(r)==="progress").length,
+    noDoc:    rows.filter(r=>!r.docsRecu).length,
+    relances: rows.reduce((s,r)=>s+(r.relances||[]).length,0),
+  }),[rows,refDate]);
+
+  const FILTERS=[
+    {key:"all",         label:"Tous"},
+    {key:"noDoc",       label:"📥 Sans docs"},
+    {key:"compta",      label:"📊 Compta en attente"},
+    {key:"progress",    label:"⏳ En cours"},
+    {key:"relances",    label:"📞 Avec relances"},
+    {key:"done",        label:"✅ Terminés"},
+    {key:"mensuel",     label:"📅 Mensuel"},
+    {key:"trimestriel", label:"📅 Trim."},
+    {key:"annuel",      label:"📅 Annuel"},
+  ];
+
+  const filtered=useMemo(()=>{
+    let data=[...rows];
+    if(search) data=data.filter(r=>
+      r.client.toLowerCase().includes(search.toLowerCase())||
+      r.periode.toLowerCase().includes(search.toLowerCase()));
+    if(filter==="noDoc")       data=data.filter(r=>!r.docsRecu);
+    if(filter==="done")        data=data.filter(r=>getRowStatus(r,refDate)==="done");
+    if(filter==="compta")      data=data.filter(r=>getComptaStatus(r)!=="done");
+    if(filter==="progress")    data=data.filter(r=>getComptaStatus(r)==="progress");
+    if(filter==="relances")    data=data.filter(r=>(r.relances||[]).length>0);
+    if(filter==="mensuel")     data=data.filter(r=>(r.regime||"mensuel")==="mensuel");
+    if(filter==="trimestriel") data=data.filter(r=>r.regime==="trimestriel");
+    if(filter==="annuel")      data=data.filter(r=>r.regime==="annuel");
+    data.sort((a,b)=>{
+      let va,vb;
+      if(sortBy==="jours"){va=daysUntilNext(a,refDate)??99999;vb=daysUntilNext(b,refDate)??99999;}
+      else if(sortBy==="compta"){const o={todo:0,progress:1,done:2,none:3};va=o[getComptaStatus(a)];vb=o[getComptaStatus(b)];}
+      else{va=(a[sortBy]??"").toString().toLowerCase();vb=(b[sortBy]??"").toString().toLowerCase();}
+      if(va<vb) return sortDir==="asc"?-1:1;
+      if(va>vb) return sortDir==="asc"?1:-1;
+      return 0;
+    });
+    return data;
+  },[rows,search,filter,sortBy,sortDir,refDate]);
+
+  const setSort=col=>{if(sortBy===col)setSortDir(d=>d==="asc"?"desc":"asc");else{setSortBy(col);setSortDir("asc");}};
+  const SI=col=>sortBy===col?(sortDir==="asc"?"↑":"↓"):"";
+  const TH=({label,col,noSort})=>(
+    <th onClick={noSort?undefined:()=>setSort(col)}
+      style={{padding:"12px 13px",textAlign:"left",fontSize:11,fontWeight:700,color:C.light,
+        letterSpacing:1,textTransform:"uppercase",cursor:noSort?"default":"pointer",userSelect:"none",whiteSpace:"nowrap"}}
+      onMouseEnter={e=>{if(!noSort)e.currentTarget.style.color=C.muted;}}
+      onMouseLeave={e=>{e.currentTarget.style.color=C.light;}}>
+      {label}{!noSort&&SI(col)?` ${SI(col)}`:""}
+    </th>);
+
+  return(
+    <div style={{minHeight:"100vh",background:C.bg,fontFamily:"'Nunito',sans-serif",color:C.text}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Nunito:wght@400;500;600;700;800&family=Lora:ital,wght@0,600;1,400&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0;}
+        ::-webkit-scrollbar{width:5px;height:5px;}
+        ::-webkit-scrollbar-track{background:transparent;}
+        ::-webkit-scrollbar-thumb{background:#e8e3dc;border-radius:99px;}
+        @keyframes slideUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes fadeIn{from{opacity:0}to{opacity:1}}
+        .fade-in{animation:fadeIn .22s ease;}
+        .tr-row{transition:background .12s;}
+        .tr-row:hover{background:#faf9f7 !important;}
+        .tr-row:hover .act-btns{opacity:1!important;}
+        .compta-cell{cursor:pointer;transition:all .15s;}
+        .compta-cell:hover{transform:scale(1.03);}
+      `}</style>
+
+      {/* Header */}
+      <div style={{background:C.card,borderBottom:`1px solid ${C.border}`,padding:"14px 28px",
+        display:"flex",alignItems:"center",justifyContent:"space-between",
+        boxShadow:C.shadow,position:"sticky",top:0,zIndex:100,gap:12,flexWrap:"wrap"}}>
+        <div style={{display:"flex",alignItems:"center",gap:13}}>
+          <div style={{width:42,height:42,background:C.sageL,borderRadius:12,border:"1.5px solid #cde0d3",
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>📒</div>
+          <div>
+            <div style={{fontFamily:"'Lora',serif",fontSize:19,fontWeight:600}}>Cabinet Comptable</div>
+            <div style={{fontSize:11,color:C.light,marginTop:1}}>Suivi mensuel — {currentMonthFr()}</div>
+          </div>
+        </div>
+        <DateRefPicker refDate={refDate} setRefDate={setRefDate}/>
+        <div style={{display:"flex",gap:8,alignItems:"center"}}>
+          <button onClick={()=>exportCSV(filtered,refDate)}
+            style={{padding:"8px 14px",borderRadius:9,border:`1px solid ${C.border}`,
+              background:"transparent",cursor:"pointer",color:C.muted,fontSize:12.5,fontFamily:"inherit",fontWeight:600}}>
+            ⬇ CSV
+          </button>
+          <button onClick={openAdd}
+            style={{padding:"9px 18px",borderRadius:10,border:"none",background:C.sage,cursor:"pointer",
+              color:"#fff",fontSize:13.5,fontFamily:"inherit",fontWeight:700,
+              boxShadow:`0 3px 10px ${C.sage}44`,display:"flex",alignItems:"center",gap:7}}>
+            <span style={{fontSize:16}}>+</span> Nouveau dossier
+          </button>
+        </div>
+      </div>
+
+      <div style={{maxWidth:1440,margin:"0 auto",padding:"26px 24px"}}>
+
+        {/* Stats */}
+        <div style={{display:"flex",gap:12,marginBottom:24,flexWrap:"wrap"}}>
+          <StatCard icon="📁" label="Dossiers"       value={stats.total}    color={C.text}/>
+          <StatCard icon="✅" label="Terminés"        value={stats.done}
+            sub={stats.total?Math.round(stats.done/stats.total*100)+"% complétés":""} color={C.sage}/>
+          <StatCard icon="⏳" label="Compta en cours" value={stats.progress} color={C.lav}/>
+          <StatCard icon="📥" label="Docs manquants"  value={stats.noDoc}
+            color={stats.noDoc>0?C.orange:C.muted}/>
+          <StatCard icon="📞" label="Relances"        value={stats.relances}
+            sub="cumulées (toutes périodes)" color={C.blue}/>
+        </div>
+
+        {/* Toolbar */}
+        <div style={{display:"flex",gap:10,marginBottom:16,flexWrap:"wrap",alignItems:"center"}}>
+          <div style={{position:"relative",flex:"1 1 200px",maxWidth:280}}>
+            <span style={{position:"absolute",left:11,top:"50%",transform:"translateY(-50%)",fontSize:14,color:C.light}}>🔍</span>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Rechercher un client…"
+              style={{width:"100%",background:C.card,border:`1.5px solid ${C.border}`,borderRadius:10,
+                padding:"8px 12px 8px 33px",fontSize:13,fontFamily:"inherit",color:C.text,outline:"none",transition:"border .15s"}}
+              onFocus={e=>e.target.style.borderColor=C.sage} onBlur={e=>e.target.style.borderColor=C.border}/>
+          </div>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap"}}>
+            {FILTERS.map(f=>(
+              <button key={f.key} onClick={()=>setFilter(f.key)}
+                style={{padding:"6px 12px",borderRadius:8,fontSize:12,fontWeight:600,cursor:"pointer",
+                  fontFamily:"inherit",transition:"all .15s",
+                  border:filter===f.key?`1.5px solid ${C.text}`:"1.5px solid transparent",
+                  background:filter===f.key?C.text:C.card,
+                  color:filter===f.key?"#fff":C.muted}}>
+                {f.label}
+              </button>))}
+          </div>
+          <div style={{marginLeft:"auto",display:"flex",gap:6,alignItems:"center"}}>
+            <span style={{fontSize:12,color:C.muted}}>{filtered.length} résultat{filtered.length!==1?"s":""}</span>
+            <div style={{display:"flex",background:C.card,border:`1px solid ${C.border}`,borderRadius:9,overflow:"hidden"}}>
+              {[{v:"table",icon:"☰"},{v:"calendar",icon:"📅"}].map(({v,icon})=>(
+                <button key={v} onClick={()=>setView(v)}
+                  style={{padding:"7px 13px",border:"none",cursor:"pointer",fontSize:13,
+                    fontFamily:"inherit",background:view===v?C.sage:"transparent",
+                    color:view===v?"#fff":C.muted,transition:"all .15s",fontWeight:600}}>
+                  {icon}
+                </button>))}
+            </div>
+          </div>
+        </div>
+
+        {/* Calendar */}
+        {view==="calendar"&&(
+          <div className="fade-in" style={{marginBottom:24}}>
+            <CalendarView rows={rows} refDate={refDate}/>
+          </div>)}
+
+        {/* Table */}
+        {view==="table"&&(
+          <div className="fade-in" style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:16,
+            overflow:"hidden",boxShadow:C.shadow}}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",minWidth:980}}>
+                <thead>
+                  <tr style={{background:"#faf8f5",borderBottom:`1px solid ${C.border}`}}>
+                    <TH label="Client"       col="client"/>
+                    <TH label="Période"      col="periode"/>
+                    <TH label="📥 Docs"      col="docsRecu"/>
+                    <TH label="📊 Compta"    col="compta"/>
+                    <TH label="Régime"       col="regime"/>
+                    <TH label="Prochain TVA" col="jours"/>
+                    <TH label="📞 Relance"   noSort/>
+                    <TH label="Notes"        noSort/>
+                    <TH label="🕓 Historique" noSort/>
+                    <TH label="Actions"      noSort/>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.length===0&&(
+                    <tr><td colSpan={10} style={{padding:"48px 20px",textAlign:"center",color:C.light,fontSize:14}}>
+                      Aucun dossier trouvé.
+                    </td></tr>)}
+                  {filtered.map(row=>{
+                    const rs       =getRowStatus(row,refDate);
+                    const days     =daysUntilNext(row,refDate);
+                    const tgt      =getNextTVADate(row,refDate);
+                    const rowBg    =rs==="done"?"#f5faf6":C.card;
+                    const regColor ={mensuel:C.blue,trimestriel:C.lav,annuel:C.teal}[row.regime||"mensuel"];
+                    const lastRel  =[...(row.relances||[])].sort((a,b)=>b.date.localeCompare(a.date))[0]||null;
+                    const histCount=(row.monthHistory||[]).length;
+                    return(
+                      <tr key={row.id} className="tr-row fade-in"
+                        style={{borderBottom:`1px solid ${C.borderL}`,background:rowBg}}>
+
+                        <td style={{padding:"12px 13px",fontWeight:700,fontSize:14,whiteSpace:"nowrap"}}>{row.client}</td>
+                        <td style={{padding:"12px 13px",fontSize:13,color:C.muted,whiteSpace:"nowrap"}}>{row.periode}</td>
+
+                        {/* Docs bouton */}
+                        <td style={{padding:"12px 13px"}}>
+                          <button onClick={()=>toggleDocs(row.id)}
+                            style={{padding:"5px 12px",borderRadius:20,
+                              border:`1.5px solid ${row.docsRecu?"#cde0d3":C.border}`,
+                              background:row.docsRecu?C.sageL:C.bg,
+                              color:row.docsRecu?C.sageD:C.muted,
+                              fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"inherit",
+                              display:"inline-flex",alignItems:"center",gap:5,
+                              transition:"all .18s",whiteSpace:"nowrap"}}>
+                            {row.docsRecu
+                              ?<><span style={{fontSize:11}}>✓</span> Reçus</>
+                              :<><span style={{fontSize:11}}>○</span> En attente</>}
+                          </button>
+                        </td>
+
+                        {/* Compta */}
+                        <td style={{padding:"12px 13px"}}>
+                          <div className="compta-cell" onClick={()=>setComptaRow(row)}>
+                            <ComptaStatus row={row}/>
+                            <div style={{fontSize:10,color:C.light,marginTop:2}}>Cliquer →</div>
+                          </div>
+                        </td>
+
+                        {/* Régime */}
+                        <td style={{padding:"12px 13px"}}>
+                          <span style={{fontSize:11.5,fontWeight:700,padding:"3px 9px",borderRadius:99,
+                            background:regColor+"18",color:regColor,border:`1px solid ${regColor}33`,whiteSpace:"nowrap"}}>
+                            {row.regime==="mensuel"?"Mensuel":row.regime==="trimestriel"?"Trim.":"Annuel"}
+                          </span>
+                        </td>
+
+                        {/* Prochain TVA */}
+                        <td style={{padding:"12px 13px"}}>
+                          {!hasTVA(row)?(
+                            <span style={{fontSize:12,color:C.light,fontStyle:"italic"}}>Sans TVA</span>
+                          ):tgt?(
+                            <div>
+                              <div style={{fontSize:12.5,color:C.text,fontWeight:600,whiteSpace:"nowrap"}}>
+                                {String(tgt.getDate()).padStart(2,"0")}/{String(tgt.getMonth()+1).padStart(2,"0")}/{tgt.getFullYear()}
+                              </div>
+                              <div style={{marginTop:2}}><DaysChip days={days}/></div>
+                            </div>
+                          ):<span style={{color:C.light}}>—</span>}
+                        </td>
+
+                        {/* Relances */}
+                        <td style={{padding:"12px 13px"}}>
+                          <button onClick={()=>setRelancesRow(row)}
+                            style={{padding:"5px 10px",borderRadius:7,
+                              border:`1px solid ${lastRel?C.blue:C.border}`,
+                              background:lastRel?C.blueL:C.bg,color:lastRel?C.blue:C.light,
+                              fontSize:12,fontWeight:600,cursor:"pointer",fontFamily:"inherit",
+                              display:"inline-flex",alignItems:"center",gap:5,transition:"all .15s",whiteSpace:"nowrap"}}>
+                            <span>📞</span>
+                            {lastRel
+                              ?<span>{fmtDate(lastRel.date)}</span>
+                              :<span style={{fontWeight:400}}>—</span>}
+                          </button>
+                        </td>
+
+                        {/* Notes */}
+                        <td style={{padding:"12px 13px"}}><NotesCell notes={row.notes}/></td>
+
+                        {/* Historique */}
+                        <td style={{padding:"12px 13px"}}>
+                          <button onClick={()=>setHistoryRow(row)}
+                            title={histCount>0?`${histCount} mois archivé${histCount>1?"s":""}`:"Aucun historique encore"}
+                            style={{padding:"5px 10px",borderRadius:7,
+                              border:`1px solid ${histCount>0?C.border:C.borderL}`,
+                              background:histCount>0?"#faf8f5":C.bg,
+                              color:histCount>0?C.muted:C.light,
+                              fontSize:12,fontWeight:histCount>0?700:400,cursor:"pointer",fontFamily:"inherit",
+                              display:"inline-flex",alignItems:"center",gap:4,whiteSpace:"nowrap"}}>
+                            🕓 {histCount>0?`${histCount} mois`:"—"}
+                          </button>
+                        </td>
+
+                        {/* Actions */}
+                        <td style={{padding:"12px 13px"}}>
+                          <div className="act-btns" style={{display:"flex",gap:4,opacity:0,transition:"opacity .14s"}}>
+                            <button onClick={()=>openEdit(row)}
+                              style={{padding:"5px 9px",borderRadius:7,border:`1px solid ${C.border}`,
+                                cursor:"pointer",fontSize:13,color:C.muted,background:C.bg}}>✏️</button>
+                            <button onClick={()=>setDeleteId(row.id)}
+                              style={{padding:"5px 9px",borderRadius:7,border:"1px solid #f0c0c0",
+                                cursor:"pointer",fontSize:13,color:C.red,background:C.redL}}>🗑️</button>
+                          </div>
+                        </td>
+                      </tr>);
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>)}
+
+        {/* Legend */}
+        <div style={{marginTop:16,display:"flex",gap:16,flexWrap:"wrap",alignItems:"center"}}>
+          {[
+            {color:C.sage, label:"Terminé"},
+            {color:C.blue, label:"Mensuel TVA"},
+            {color:C.lav,  label:"Trimestriel TVA"},
+            {color:C.teal, label:"Annuel — sans TVA mensuelle"},
+          ].map(({color,label})=>(
+            <div key={label} style={{display:"flex",alignItems:"center",gap:5,fontSize:11.5,color:C.muted}}>
+              <div style={{width:8,height:8,borderRadius:"50%",background:color}}/>{label}
+            </div>))}
+          <div style={{marginLeft:"auto",fontSize:11,color:C.light}}>
+            Archivage automatique fin de mois • Relances conservées • 🕓 Historique complet
+          </div>
+        </div>
+      </div>
+
+      {/* Modals */}
+      {comptaRow&&(
+        <ComptaModal row={rows.find(r=>r.id===comptaRow.id)||comptaRow}
+          onClose={()=>setComptaRow(null)} onUpdate={updateTasksDone}/>)}
+      {relancesRow&&(
+        <RelancesModal row={rows.find(r=>r.id===relancesRow.id)||relancesRow}
+          onClose={()=>setRelancesRow(null)} onUpdate={updateRelances}/>)}
+      {historyRow&&(
+        <HistoryModal row={rows.find(r=>r.id===historyRow.id)||historyRow}
+          onClose={()=>setHistoryRow(null)}/>)}
+      {(modal==="add"||modal==="edit")&&(
+        <DossierModal form={form} setForm={setForm} onSave={handleSave} onClose={closeModal} isEdit={modal==="edit"}/>)}
+      {deleteId!==null&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(30,25,20,.45)",zIndex:1000,display:"flex",
+          alignItems:"center",justifyContent:"center",backdropFilter:"blur(3px)"}}
+          onClick={e=>e.target===e.currentTarget&&setDeleteId(null)}>
+          <div style={{background:C.card,borderRadius:16,padding:"28px 32px",width:360,textAlign:"center",
+            boxShadow:C.shadowLg,animation:"slideUp .2s ease"}}>
+            <div style={{fontSize:32,marginBottom:12}}>🗑️</div>
+            <h4 style={{fontFamily:"'Lora',serif",fontSize:17,fontWeight:600,marginBottom:8}}>Supprimer ce dossier ?</h4>
+            <p style={{fontSize:13,color:C.muted,marginBottom:22}}>Cette action est irréversible.</p>
+            <div style={{display:"flex",gap:10,justifyContent:"center"}}>
+              <button onClick={()=>setDeleteId(null)}
+                style={{padding:"9px 20px",borderRadius:9,border:`1px solid ${C.border}`,background:"transparent",
+                  cursor:"pointer",color:C.muted,fontSize:14,fontFamily:"inherit",fontWeight:600}}>Annuler</button>
+              <button onClick={handleDelete}
+                style={{padding:"9px 20px",borderRadius:9,border:"none",background:C.red,cursor:"pointer",
+                  color:"#fff",fontSize:14,fontFamily:"inherit",fontWeight:700}}>Supprimer</button>
+            </div>
+          </div>
+        </div>)}
+    </div>);
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
